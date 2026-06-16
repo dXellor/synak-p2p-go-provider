@@ -199,15 +199,42 @@ func (p *Provider) handleConnection(conn net.Conn) {
 		}
 	}
 
-	// Phase 2: accept FILE_DATA pushes until ACK.
+	// Phase 2: accept FILE_DATA / FILE_DATA_STREAM pushes until ACK.
 	for {
 		req, err := s.Read()
 		if err != nil || req.Type == "ACK" {
 			break
 		}
-		if req.Type == "FILE_DATA" && req.Entry != nil {
+		if req.Entry == nil {
+			continue
+		}
+		switch req.Type {
+		case "FILE_DATA":
 			content, _ := DecodeContent(req.Content)
 			p.applyIncomingFile(*req.Entry, content, peer)
+		case "FILE_DATA_STREAM":
+			absPath := filepath.Join(p.watchDir, filepath.FromSlash(req.Entry.Path))
+			// Decide before writing — if rejected, drain bytes to keep stream valid.
+			local := p.index.Get(req.Entry.Path)
+			accept := local == nil
+			if !accept {
+				switch Reconcile(*local, *req.Entry, p.nodeID) {
+				case AcceptRemote:
+					accept = true
+				case Conflict:
+					accept = p.resolveConflict(*local, *req.Entry, req.Entry.Path) == AcceptRemote
+				}
+			}
+			if accept {
+				if err := RecvStreamToDisk(s, req.Size, absPath); err != nil {
+					log.Printf("go-p2p: recv stream %q failed: %v", req.Entry.Path, err)
+					return // connection state unknown after partial read
+				}
+				p.index.ApplyRemote(*req.Entry, nil) //nolint:errcheck
+				log.Printf("go-p2p: accepted %q from %s", req.Entry.Path, peer)
+			} else {
+				DrainStream(s, req.Size)
+			}
 		}
 	}
 
@@ -292,10 +319,21 @@ func (p *Provider) syncWithPeer(addr string) error {
 		if err != nil {
 			return err
 		}
-		if resp.Type == "FILE_DATA" && resp.Entry != nil {
-			content, _ := DecodeContent(resp.Content)
-			p.applyIncomingFile(*resp.Entry, content, addr)
-			log.Printf("go-p2p: pulled %q from %s", path, addr)
+		if resp.Entry != nil {
+			switch resp.Type {
+			case "FILE_DATA":
+				content, _ := DecodeContent(resp.Content)
+				p.applyIncomingFile(*resp.Entry, content, addr)
+				log.Printf("go-p2p: pulled %q from %s", path, addr)
+			case "FILE_DATA_STREAM":
+				absPath := filepath.Join(p.watchDir, filepath.FromSlash(resp.Entry.Path))
+				if err := RecvStreamToDisk(s, resp.Size, absPath); err != nil {
+					log.Printf("go-p2p: recv stream %q from %s failed: %v", path, addr, err)
+				} else {
+					p.applyIncomingFile(*resp.Entry, nil, addr)
+					log.Printf("go-p2p: pulled %q from %s", path, addr)
+				}
+			}
 		}
 	}
 
@@ -315,12 +353,9 @@ func (p *Provider) syncWithPeer(addr string) error {
 			continue
 		}
 		absPath := filepath.Join(p.watchDir, filepath.FromSlash(path))
-		content, err := os.ReadFile(absPath)
-		if err != nil {
+		if err := SendFileData(s, path, absPath, entry); err != nil {
+			log.Printf("go-p2p: send %q to %s failed: %v", path, addr, err)
 			continue
-		}
-		if err := s.Send(FileDataMsg(path, content, entry)); err != nil {
-			return err
 		}
 		log.Printf("go-p2p: pushed %q to %s", path, addr)
 	}
@@ -429,11 +464,9 @@ func (p *Provider) serveFile(s *Session, path string) {
 		return
 	}
 	absPath := filepath.Join(p.watchDir, filepath.FromSlash(path))
-	content, err := os.ReadFile(absPath)
-	if err != nil {
-		return
+	if err := SendFileData(s, path, absPath, *entry); err != nil {
+		log.Printf("go-p2p: serve %q failed: %v", path, err)
 	}
-	s.Send(FileDataMsg(path, content, *entry)) //nolint:errcheck
 }
 
 // --- file watcher handler ---
