@@ -19,6 +19,8 @@ type Message struct {
 	NodeID  string               `json:"node_id,omitempty"`
 	Index   map[string]FileEntry `json:"index,omitempty"`
 	Path    string               `json:"path,omitempty"`
+	From    string               `json:"from,omitempty"`   // RENAME_FILE: source path
+	To      string               `json:"to,omitempty"`     // RENAME_FILE: destination path
 	Content string               `json:"content"`          // base64-encoded bytes (FILE_DATA)
 	Size    int64                `json:"size,omitempty"`   // raw byte count (FILE_DATA_STREAM)
 	Entry   *FileEntry           `json:"entry,omitempty"`
@@ -88,6 +90,10 @@ func FileDataMsg(path string, content []byte, entry FileEntry) Message {
 
 func FileDataStreamMsg(path string, size int64, entry FileEntry) Message {
 	return Message{Type: "FILE_DATA_STREAM", Path: path, Size: size, Entry: &entry}
+}
+
+func RenameFileMsg(fromPath, toPath string, entry FileEntry) Message {
+	return Message{Type: "RENAME_FILE", From: fromPath, To: toPath, Entry: &entry}
 }
 
 func SyncDoneMsg() Message          { return Message{Type: "SYNC_DONE"} }

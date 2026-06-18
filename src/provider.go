@@ -235,6 +235,10 @@ func (p *Provider) handleConnection(conn net.Conn) {
 			} else {
 				DrainStream(s, req.Size)
 			}
+		case "RENAME_FILE":
+			if req.From != "" && req.To != "" && req.Entry != nil {
+				p.applyRename(req.From, req.To, *req.Entry, peer)
+			}
 		}
 	}
 
@@ -342,7 +346,26 @@ func (p *Provider) syncWithPeer(addr string) error {
 	}
 
 	// Phase 2: push files peer is missing or behind on.
+	peerLiveByChecksum := make(map[string]string)
+	for path, entry := range peerIndex {
+		if !entry.Deleted && entry.Checksum != "" {
+			peerLiveByChecksum[entry.Checksum] = path
+		}
+	}
+	renames := make(map[string]string) // new path → old peer path
 	localIndex := p.index.AllEntries()
+	for path, entry := range localIndex {
+		if entry.Deleted || entry.Checksum == "" {
+			continue
+		}
+		old, ok := peerLiveByChecksum[entry.Checksum]
+		if ok && old != path {
+			if ourOld := p.index.Get(old); ourOld != nil && ourOld.Deleted {
+				renames[path] = old
+			}
+		}
+	}
+
 	for path, entry := range localIndex {
 		if entry.Deleted {
 			continue
@@ -350,6 +373,14 @@ func (p *Provider) syncWithPeer(addr string) error {
 		remote, ok := peerIndex[path]
 		shouldPush := !ok || remote.Deleted || Reconcile(remote, entry, p.nodeID) == AcceptRemote
 		if !shouldPush {
+			continue
+		}
+		if oldPath, isRename := renames[path]; isRename {
+			if err := s.Send(RenameFileMsg(oldPath, path, entry)); err != nil {
+				log.Printf("go-p2p: send rename %q → %q to %s failed: %v", oldPath, path, addr, err)
+			} else {
+				log.Printf("go-p2p: sent rename %q → %q to %s", oldPath, path, addr)
+			}
 			continue
 		}
 		absPath := filepath.Join(p.watchDir, filepath.FromSlash(path))
@@ -417,6 +448,12 @@ func (p *Provider) applyRemoteDeletions(remoteIndex map[string]FileEntry, label 
 	if !p.syncDeletes {
 		return
 	}
+	remoteLiveByChecksum := make(map[string]string)
+	for path, entry := range remoteIndex {
+		if !entry.Deleted && entry.Checksum != "" {
+			remoteLiveByChecksum[entry.Checksum] = path
+		}
+	}
 	for path, remote := range remoteIndex {
 		if !remote.Deleted {
 			continue
@@ -424,6 +461,9 @@ func (p *Provider) applyRemoteDeletions(remoteIndex map[string]FileEntry, label 
 		local := p.index.Get(path)
 		if local == nil || local.Deleted {
 			continue
+		}
+		if newPath, ok := remoteLiveByChecksum[local.Checksum]; ok && newPath != path {
+			continue // rename incoming — skip deletion
 		}
 		if Reconcile(*local, remote, p.nodeID) == AcceptRemote {
 			if err := p.index.ApplyRemote(remote, nil); err != nil {
@@ -433,6 +473,46 @@ func (p *Provider) applyRemoteDeletions(remoteIndex map[string]FileEntry, label 
 			log.Printf("go-p2p: applied remote deletion of %q from %s", path, label)
 		}
 	}
+}
+
+func (p *Provider) applyRename(fromPath, toPath string, newEntry FileEntry, label string) {
+	absFrom := filepath.Join(p.watchDir, filepath.FromSlash(fromPath))
+	absTo   := filepath.Join(p.watchDir, filepath.FromSlash(toPath))
+
+	fromEntry := p.index.Get(fromPath)
+	if fromEntry == nil || fromEntry.Checksum != newEntry.Checksum {
+		log.Printf("go-p2p: rename %q → %q: source missing or checksum mismatch, will re-sync next round", fromPath, toPath)
+		return
+	}
+	if _, err := os.Stat(absFrom); err != nil {
+		log.Printf("go-p2p: rename %q → %q: source not on disk, will re-sync next round", fromPath, toPath)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(absTo), 0o755); err != nil {
+		log.Printf("go-p2p: rename %q → %q: mkdir failed: %v", fromPath, toPath, err)
+		return
+	}
+	if err := os.Rename(absFrom, absTo); err != nil {
+		log.Printf("go-p2p: rename %q → %q: os.Rename failed: %v", fromPath, toPath, err)
+		return
+	}
+	clk := fromEntry.GetClock(p.nodeID)
+	clk.Increment()
+	tombstone := FileEntry{Path: fromPath, VectorClockData: clk.ToDict(), Deleted: true}
+	p.index.ApplyRemote(tombstone, nil) //nolint:errcheck
+	p.index.ApplyRemote(newEntry, nil)  //nolint:errcheck
+
+	// Prune empty parent directories left behind by the rename.
+	parent := filepath.Dir(absFrom)
+	for parent != p.watchDir {
+		entries, err := os.ReadDir(parent)
+		if err != nil || len(entries) > 0 {
+			break
+		}
+		os.Remove(parent) //nolint:errcheck
+		parent = filepath.Dir(parent)
+	}
+	log.Printf("go-p2p: renamed %q → %q from %s", fromPath, toPath, label)
 }
 
 func (p *Provider) applyIncomingFile(entry FileEntry, content []byte, label string) {
