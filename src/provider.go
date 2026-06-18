@@ -313,6 +313,7 @@ func (p *Provider) syncWithPeer(addr string) error {
 	peerIndex := msg.Index
 
 	p.applyRemoteDeletions(peerIndex, addr)
+	p.applyLocalRenames(peerIndex)
 
 	// Phase 1: pull files we need.
 	for _, path := range p.computeNeeded(peerIndex) {
@@ -472,6 +473,34 @@ func (p *Provider) applyRemoteDeletions(remoteIndex map[string]FileEntry, label 
 			}
 			log.Printf("go-p2p: applied remote deletion of %q from %s", path, label)
 		}
+	}
+}
+
+func (p *Provider) applyLocalRenames(remoteIndex map[string]FileEntry) {
+	remoteLiveByChecksum := make(map[string]string)
+	for path, entry := range remoteIndex {
+		if !entry.Deleted && entry.Checksum != "" {
+			remoteLiveByChecksum[entry.Checksum] = path
+		}
+	}
+	remoteTombstoned := make(map[string]bool)
+	for path, entry := range remoteIndex {
+		if entry.Deleted {
+			remoteTombstoned[path] = true
+		}
+	}
+	for path, local := range p.index.AllEntries() {
+		if local.Deleted || local.Checksum == "" {
+			continue
+		}
+		if !remoteTombstoned[path] {
+			continue
+		}
+		newPath, ok := remoteLiveByChecksum[local.Checksum]
+		if !ok || newPath == path {
+			continue
+		}
+		p.applyRename(path, newPath, remoteIndex[newPath], "remote")
 	}
 }
 
