@@ -402,18 +402,25 @@ func (p *Provider) syncWithPeer(addr string) error {
 
 func (p *Provider) computeNeeded(remoteIndex map[string]FileEntry) []string {
 	localIndex := p.index.AllEntries()
+	localLiveByChecksum := make(map[string]string)
+	for path, entry := range localIndex {
+		if !entry.Deleted && entry.Checksum != "" {
+			localLiveByChecksum[entry.Checksum] = path
+		}
+	}
 	var needed []string
 	for path, remote := range remoteIndex {
 		if remote.Deleted {
 			continue
 		}
 		local, ok := localIndex[path]
-		if !ok {
-			needed = append(needed, path)
-			continue
-		}
-		if local.Deleted {
-			if Reconcile(local, remote, p.nodeID) == AcceptRemote {
+		if !ok || local.Deleted {
+			if existing, has := localLiveByChecksum[remote.Checksum]; has && existing != path {
+				continue // we have this content under a different name — it's a rename
+			}
+			if !ok {
+				needed = append(needed, path)
+			} else if Reconcile(local, remote, p.nodeID) == AcceptRemote {
 				needed = append(needed, path)
 			}
 			continue
