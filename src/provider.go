@@ -33,6 +33,10 @@ type Provider struct {
 	stopCh   chan struct{}
 	paused   atomic.Bool
 
+	// Paths seen as remotely deleted once but not yet confirmed — deferred one round
+	// to avoid deleting files mid-move when the watcher hasn't indexed the new path yet.
+	pendingDeletes sync.Map // map[string]struct{}
+
 	// status fields
 	statusMu sync.RWMutex
 	state    string
@@ -468,12 +472,22 @@ func (p *Provider) applyRemoteDeletions(remoteIndex map[string]FileEntry, label 
 		}
 		local := p.index.Get(path)
 		if local == nil || local.Deleted {
+			p.pendingDeletes.Delete(path)
 			continue
 		}
 		if newPath, ok := remoteLiveByChecksum[local.Checksum]; ok && newPath != path {
+			p.pendingDeletes.Delete(path)
 			continue // rename incoming — skip deletion
 		}
 		if Reconcile(*local, remote, p.nodeID) == AcceptRemote {
+			if _, pending := p.pendingDeletes.Load(path); !pending {
+				// Defer by one round: a move whose create event hasn't landed yet
+				// would look identical to a genuine delete at this moment.
+				p.pendingDeletes.Store(path, struct{}{})
+				log.Printf("go-p2p: deferring deletion of %q — confirming next round", path)
+				continue
+			}
+			p.pendingDeletes.Delete(path)
 			if err := p.index.ApplyRemote(remote, nil); err != nil {
 				log.Printf("go-p2p: apply deletion of %q failed: %v", path, err)
 				continue
