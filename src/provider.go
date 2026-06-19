@@ -297,6 +297,7 @@ func (p *Provider) RunSyncRound() {
 }
 
 func (p *Provider) syncWithPeer(addr string) error {
+	log.Printf("go-p2p: starting sync with %s", addr)
 	host, port := parsePeer(addr, p.port)
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
 	if err != nil {
@@ -399,7 +400,11 @@ func (p *Provider) syncWithPeer(addr string) error {
 	if err := s.Send(AckMsg(p.nodeID)); err != nil {
 		return err
 	}
-	return p.index.Save()
+	if err := p.index.Save(); err != nil {
+		return err
+	}
+	log.Printf("go-p2p: sync with %s complete", addr)
+	return nil
 }
 
 // --- shared helpers ---
